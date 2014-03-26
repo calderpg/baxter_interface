@@ -53,6 +53,8 @@ import baxter_control
 import baxter_dataflow
 import baxter_interface
 
+# Add XTF to provide logging support
+import xtf.xtf as XTF
 
 class JointTrajectoryActionServer(object):
     def __init__(self, limb, reconfig_server, rate=100.0):
@@ -66,6 +68,9 @@ class JointTrajectoryActionServer(object):
         self._action_name = rospy.get_name()
         self._server.start()
         self._limb = baxter_interface.Limb(limb)
+
+        # Make a parser for XTF trajectories
+        self._parser = XTF.XTFParser()
 
         # Action Feedback/Result
         self._fdbk = FollowJointTrajectoryFeedback()
