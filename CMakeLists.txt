@@ -12,6 +12,7 @@ find_package(catkin
   dynamic_reconfigure
   baxter_core_msgs
   xtf
+  deformable_astar
 )
 
 catkin_python_setup()
@@ -32,6 +33,7 @@ catkin_package(
   dynamic_reconfigure
   baxter_core_msgs
   xtf
+  deformable_astar
 )
 
 install(
