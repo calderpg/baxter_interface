@@ -26,3 +26,4 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 from .joint_trajectory_action import JointTrajectoryActionServer
+from .simulated_joint_trajectory_action import SimulatedJointTrajectoryActionServer

@@ -60,9 +60,11 @@ import xtf.xtf as XTF
 import deformable_astar.grc as GRC
 from baxter_uncertainty.srv import *
 import numpy
+import random
+from sensor_msgs.msg import JointState
 
 
-class JointTrajectoryActionServer(object):
+class SimulatedJointTrajectoryActionServer(object):
 
     def __init__(self, limb, reconfig_server, rate=100.0, disable_preemption=True):
         self._dyn = reconfig_server
@@ -70,7 +72,18 @@ class JointTrajectoryActionServer(object):
         self._server = actionlib.SimpleActionServer(self._ns, FollowJointTrajectoryAction, execute_cb=self._grc_trajectory_action, auto_start=False)
         self._action_name = rospy.get_name()
         self._server.start()
-        self._limb = baxter_interface.Limb(limb)
+        if limb == "left":
+            self._joint_names = ["left_s0", "left_s1", "left_e0", "left_e1", "left_w0", "left_w1", "left_w2"]
+        elif limb == "right":
+            self._joint_names = ["right_s0", "right_s1", "right_e0", "right_e1", "right_w0", "right_w1", "right_w2"]
+
+        # Initialize the current state
+        self._current_position = []
+        for idx in range(len(self._joint_names)):
+            self._current_position.append(0.0)
+
+        # Set up joint state feedback
+        self._state_sub = rospy.Subscriber("joint_states", JointState, self._state_cb)
 
         # Allow preemption to be disabled for testing
         self._disable_preemption = disable_preemption
@@ -85,13 +98,27 @@ class JointTrajectoryActionServer(object):
         self._grc_control_factor = 10.0
 
         # Set the gain to use when computing corrections
-        self._grc_gain = 0.1
+        self._grc_gain = 0.25
 
-        # Set the maximum distance between states to use when subsampling a trajectory
-        self._trajectory_increment = 0.01
+        # Set the uncertainty params for simulated actuation
+        self._minimum_variance = 0.001
+        self._variance_scaling = 0.001
+
+        # Setup the fake command publisher
+        self._command_pub = rospy.Publisher('joint_commands', JointState)
 
         # Set the amount to "overtime" each step of a trajectory - we do this to give Baxter an easier time
-        self._overtime_multiplier = 2.0
+        self._overtime_multiplier = 1.0
+
+        # Set the location for log files
+        self._log_location = "/home/calderpg/Desktop/trajectory_examples/"
+
+        # Set the correction mode
+        self._control_mode = ComputeGradientRequest.POINT_NEIGHBORS
+        #self._control_mode = ComputeGradientRequest.GRADIENT_BLACKLIST
+        #self._control_mode = ComputeGradientRequest.SAMPLED_EIGHT_CONNECTED
+        #self._control_mode = ComputeGradientRequest.HYBRID_FOUR_CONNECTED
+        #self._control_mode = ComputeGradientRequest.FOUR_CONNECTED
 
         # Make a client to query the feature server
         self._feature_client = rospy.ServiceProxy("compute_baxter_cost_features", ComputeFeatures, persistent=True)
@@ -111,14 +138,11 @@ class JointTrajectoryActionServer(object):
         self._error_threshold = dict()
         self._dflt_vel = dict()
 
-        # Create our PID controllers
-        self._pid = dict()
-        for joint in self._limb.joint_names():
-            self._pid[joint] = baxter_control.PID()
-
-        # Set joint state publishing to specified control rate
-        self._pub_rate = rospy.Publisher('/robot/joint_state_publish_rate', UInt16)
-        self._pub_rate.publish(self._control_rate)
+    def _state_cb(self, msg):
+        new_state = []
+        for name in self._joint_names:
+            new_state.append(msg.position[msg.name.index(name)])
+        self._current_position = new_state
 
     def _call_feature_client_safe(self, req, max_tries=5):
         try:
@@ -141,33 +165,26 @@ class JointTrajectoryActionServer(object):
     def _get_trajectory_parameters(self, joint_names):
         self._goal_time = self._dyn.config['goal_time']
         for jnt in joint_names:
-            if not jnt in self._limb.joint_names():
+            if not jnt in self._joint_names:
                 rospy.logerr(
                     "%s: Trajectory Aborted - Provided Invalid Joint Name %s" %
                     (self._action_name, jnt,))
                 self._result.error_code = self._result.INVALID_JOINTS
                 self._server.set_aborted(self._result)
                 return
-            kp = self._dyn.config[jnt + '_kp']
-            ki = self._dyn.config[jnt + '_ki']
-            kd = self._dyn.config[jnt + '_kd']
-            #kp = 5.0
-            #ki = 1.0
-            #kd = 2.0
-            self._pid[jnt].set_kp(kp)
-            self._pid[jnt].set_ki(ki)
-            self._pid[jnt].set_kd(kd)
             goal_error = self._dyn.config[jnt + '_goal']
             self._goal_error[jnt] = goal_error
             trajectory_error = self._dyn.config[jnt + '_trajectory']
             self._error_threshold[jnt] = trajectory_error
             self._dflt_vel[jnt] = self._dyn.config[jnt + '_default_velocity']
-            self._pid[jnt].initialize()
-            rospy.logdebug("%s: Configured joint %s PID with kp: %f ki: %f kd: %f" % (self._action_name, jnt, kp, ki, kd,))
-            rospy.logdebug("%s: Configured joint %s with goal_error %f and trajectory_error %f" % (self._action_name, jnt, goal_error, trajectory_error,))
 
     def _get_current_position(self, joint_names):
-        return [self._limb.joint_angle(joint) for joint in joint_names]
+        temp_copy = deepcopy(self._current_position)
+        ordered_config = []
+        for joint_name in joint_names:
+            local_index = self._joint_names.index(joint_name)
+            ordered_config.append(temp_copy[local_index])
+        return ordered_config
 
     def _get_current_error(self, joint_names, set_point):
         current = self._get_current_position(joint_names)
@@ -187,42 +204,6 @@ class JointTrajectoryActionServer(object):
         self._server.publish_feedback(feedback_msg)
         return feedback_msg.actual.positions
 
-    def _command_stop(self, joint_names):
-        velocities = [0.0] * len(joint_names)
-        cmd = dict(zip(joint_names, velocities))
-        self._limb.set_joint_velocities(cmd)
-        self._limb.set_joint_positions(self._limb.joint_angles())
-
-    def _command_velocities(self, joint_names, positions):
-        velocities = []
-        if self._server.is_preempt_requested():
-            if self._disable_preemption:
-                rospy.logwarn("%s: Preemption requested, but preemption is currently disabled" % (self._action_name,))
-            else:
-                self._command_stop(joint_names)
-                rospy.loginfo("%s: Trajectory Preempted" % (self._action_name,))
-                self._server.set_preempted()
-                return False
-        deltas = self._get_current_error(joint_names, positions)
-        for [name, error] in deltas:
-            # Check to make sure we're following the path inside the error tolerances
-            if self._error_threshold[name] > 0.0:
-                if abs(error) > abs(self._error_threshold[name]):
-                    self._command_stop(joint_names)
-                    rospy.logerr("%s: Exceeded error threshold on joint %s: %f" % (self._action_name, name, error,))
-                    self._result.error_code = self._result.PATH_TOLERANCE_VIOLATED
-                    self._server.set_aborted(self._result)
-                    return False
-            else:
-                rospy.logdebug("%s: No error threshold for joint %s" % (self._action_name, name,))
-            # Since we're following the path safely, compute the new velocity command with the Rethink PID controller
-            velocities.append(self._pid[name].compute_output(error))
-        # Combine the joint names and velocities for the Rethink API
-        cmd = dict(zip(joint_names, velocities))
-        # Command the arm in velocity mode with the Rethink API
-        self._limb.set_joint_velocities(cmd)
-        return True
-
     def _interpolate(self, a, b, percent):
         return a + ((b - a) * percent)
 
@@ -232,6 +213,24 @@ class JointTrajectoryActionServer(object):
         for [pp1, pp2] in zip(p1, p2):
             interpolated.append(self._interpolate(pp1, pp2, percent))
         return interpolated
+
+    def _sample_resultant_state(self, current_configuration, target_configuration):
+        # For each joint, sample a new joint value given the current state and control input (target-current)
+        # Determine the control input
+        control_input = [0.0 for idx in xrange(len(current_configuration))]
+        for index in range(len(current_configuration)):
+            control_input[index] = target_configuration[index] - current_configuration[index]
+        # Sample a new configuration based on the control input
+        sampled_configuration = [0.0 for idx in xrange(len(current_configuration))]
+        for index in range(len(current_configuration)):
+            sampled_configuration[index] = self._sample_joint(current_configuration[index], control_input[index])
+        return sampled_configuration
+
+    def _sample_joint(self, current_value, control_input):
+        mean = current_value + control_input
+        variance = (self._variance_scaling * control_input) + self._minimum_variance
+        sigma = math.sqrt(abs(variance))
+        return random.gauss(mean, sigma)
 
     def _execute_to_state(self, joint_names, target_configuration, exec_time):
         # Overtime the current step
@@ -249,6 +248,8 @@ class JointTrajectoryActionServer(object):
         print("Going to new state " + str(target_configuration) + " for " + str(exec_time) + " seconds")
         # Now that we think the point is safe to execute, let's do it
         start_configuration = self._get_current_position(joint_names)
+        # Sample the 'real' target
+        real_target_configuration = self._sample_resultant_state(start_configuration, target_configuration)
         # Get the operating rate
         control_rate = rospy.Rate(self._control_rate)
         control_duration = 1.0 / self._control_rate
@@ -258,22 +259,21 @@ class JointTrajectoryActionServer(object):
         while elapsed_time <= (exec_time + 2 * control_duration):
             # Interpolate a current state from start and target configuration
             percent = elapsed_time / exec_time
-            target_point = self._interpolate_joints(start_configuration, target_configuration, percent)
+            target_point = self._interpolate_joints(start_configuration, real_target_configuration, percent)
             # Execute to the current target
-            exec_status = self._command_velocities(joint_names, target_point)
-            # Check the status of the execution command - if it failed, we abort
-            if not exec_status:
-                rospy.logerr("%s: Execution failed, aborting" % (self._action_name,))
-                return False
+            self._command_to_state(joint_names, target_point)
             # Wait for the rest of the time step
             control_rate.sleep()
             # Update time
             elapsed_time = rospy.get_time() - start_time
-        # At the end, we set the arms back into position mode
-        target_cmd = dict(zip(joint_names, target_configuration))
-        self._limb.set_joint_positions(target_cmd)
-        # If we have reached the end successfully, return success
         return True
+
+    def _command_to_state(self, joint_names, joint_values):
+        command_msg = JointState()
+        command_msg.header.stamp = rospy.get_rostime()
+        command_msg.name = joint_names
+        command_msg.position = joint_values
+        self._command_pub.publish(command_msg)
 
     def _get_ordered_configuration(self, joint_names, configuration):
         # Figure out left or right side
@@ -306,43 +306,6 @@ class JointTrajectoryActionServer(object):
             ordered_configuration.append(configuration[joint_names.index('right_w1')])
             ordered_configuration.append(configuration[joint_names.index('right_w2')])
             return ordered_configuration
-
-    def _euclidean_distance(self, p1, p2):
-        dist = 0.0
-        assert(len(p1) == len(p2))
-        for [pp1, pp2] in zip(p1, p2):
-            dist += ((pp2 - pp1) ** 2)
-        return math.sqrt(dist)
-
-    def _interpolate_timesteps(self, start_secs, end_secs, percent):
-        new_time = start_secs + ((end_secs - start_secs) * percent)
-        return new_time
-
-    def _subsample_between_points(self, joint_names, start_point, end_point, sequence_number):
-        start_configuration = self._get_ordered_configuration(joint_names, start_point.positions)
-        end_configuration = self._get_ordered_configuration(joint_names, end_point.positions)
-        distance = self._euclidean_distance(start_configuration, end_configuration)
-        increments = int(round(distance / self._trajectory_increment))
-        rospy.loginfo("Subsampling distance " + str(distance) + " into " + str(increments) + " increments")
-        if increments <= 1:
-            end_xtf_state = XTF.XTFState(end_configuration, [], [], [], [], [], sequence_number, end_point.time_from_start.to_secs())
-            return [end_xtf_state]
-        else:
-            subsampled = []
-            for index in range(1, increments):
-                percent = float(index) / float(increments)
-                # Interpolate the configuration
-                interpolated_configuration = self._interpolate(start_configuration, end_configuration, percent)
-                # Interpolate the timestamp
-                interpolated_timestamp = self._interpolate_timesteps(start_point.time_from_start.to_sec(), end_point.time_from_start.to_secs(), percent)
-                # Make a new XTF state
-                subsampled_state = XTF.XTFState(interpolated_configuration, [], [], [], [], [], sequence_number + len(subsampled), interpolated_timestamp)
-                # Store the new state
-                subsampled.append(subsampled_state)
-            # Add the end state
-            end_xtf_state = XTF.XTFState(end_configuration, [], [], [], [], [], sequence_number + len(subsampled), end_point.time_from_start.to_secs())
-            subsampled.append(end_xtf_state)
-            return subsampled
 
     def _grc_trajectory_action(self, goal):
         joint_names = goal.trajectory.joint_names
@@ -385,46 +348,39 @@ class JointTrajectoryActionServer(object):
             return
         trajectory_name = "baxter_trajectory_" + side + time.strftime("_%d-%m-%Y_%H-%M-%S_executed.xtf")
         current_xtf = XTF.XTFTrajectory(trajectory_name, "recorded", "timed", "joint", "baxter", "baxter_FJTA", None, None, joint_names, [], [])
-        # Subsample and convert the entire trajectory to XTF
-        rospy.loginfo("Resizing and converting trajectory to XTF and computing features...");
-        sequence_number = 0
-        # Convert the first point
-        first_raw_point = trajectory_points[0]
-        first_configuration = self._get_ordered_configuration(joint_names, first_raw_point.positions)
-        first_timestamp = first_raw_point.time_from_start.to_sec()
-        first_xtf_state = XTF.XTFState(first_configuration, [], [], [], [], [], sequence_number, first_timestamp)
-        current_xtf.trajectory.append(first_xtf_state)
-        sequence_number = 1
-        # Loop through the rest of the trajectory, subsampling between each pair of points
-        for index in xrange(1, len(trajectory_points)):
-            # Get the beginning and end of the current range
-            start_point = trajectory_points[index - 1]
-            end_point = trajectory_points[index]
-            # Subsample between them
-            subsampled_sequence = self._subsample_between_points(joint_names, start_point, end_point, sequence_number)
-            current_xtf.trajectory += subsampled_sequence
-            sequence_number += len(subsampled_sequence)
-        # Go through the XTF trajectory and compute the expected cost of each state
-        for state in current_xtf.trajectory:
+        # Convert the entire trajectory into an XTF trajectory
+        rospy.loginfo("Converting trajectory to XTF and computing features...");
+        sequence = 0
+        for point in trajectory_points:
+            configuration = self._get_ordered_configuration(joint_names, point.positions)
+            new_xtf_state = XTF.XTFState(configuration, [], [], [], [], [], sequence, point.time_from_start.to_sec())
             # Get features for the current state
             if side == "left":
                 req = ComputeFeaturesRequest()
                 req.ArmOption = ComputeFeaturesRequest.LEFT_ARM_ONLY
                 req.FeatureOption = ComputeFeaturesRequest.COST_ONLY
                 #req.FeatureOption = ComputeFeaturesRequest.COST_AND_BRITTLENESS
-                req.LeftArmConfiguration = state.position_desired
+                req.LeftArmConfiguration = new_xtf_state.position_desired
                 req.GradientMultiplier = 0.1
                 res = self._call_feature_client_safe(req)
-                state.extras["expected_cost"] = res.LeftArmCost
             elif side == "right":
                 req = ComputeFeaturesRequest()
                 req.ArmOption = ComputeFeaturesRequest.RIGHT_ARM_ONLY
                 req.FeatureOption = ComputeFeaturesRequest.COST_ONLY
                 #req.FeatureOption = ComputeFeaturesRequest.COST_AND_BRITTLENESS
-                req.RightArmConfiguration = state.position_desired
+                req.RightArmConfiguration = new_xtf_state.position_desired
                 req.GradientMultiplier = 0.1
                 res = self._call_feature_client_safe(req)
-                state.extras["expected_cost"] = res.RightArmCost
+            # Save the computed features
+            if side == "left":
+                new_xtf_state.extras["state_cost"] = res.LeftArmCost
+                #new_xtf_state.extras["state_brittleness"] = res.LeftArmBrittleness
+            elif side == "right":
+                new_xtf_state.extras["state_cost"] = res.RightArmCost
+                #new_xtf_state.extras["state_brittleness"] = res.RightArmBrittleness
+            # Save the point
+            current_xtf.trajectory.append(new_xtf_state)
+            sequence += 1
         rospy.loginfo("...conversion finished")
         rospy.loginfo("Preprocessing trajectory...")
         # Preprocess the trajectory to identify GRC use
@@ -433,7 +389,7 @@ class JointTrajectoryActionServer(object):
             state.extras["use_grc"] = True
         rospy.loginfo("...preprocessing complete")
         # Save a copy before execution
-        self._parser.ExportTraj(current_xtf, "preliminary_" + current_xtf.uid)
+        self._parser.ExportTraj(current_xtf, self._log_location + "preliminary_" + current_xtf.uid)
         # Get ready to execute the trajectory for real
         # Load parameters for trajectory
         self._get_trajectory_parameters(joint_names)
@@ -502,7 +458,7 @@ class JointTrajectoryActionServer(object):
                     if side == "left":
                         req = ComputeGradientRequest()
                         req.ArmGradientOption = ComputeGradientRequest.LEFT_ARM_ONLY
-                        req.ControlGenerationMode = ComputeGradientRequest.POINT_NEIGHBORS
+                        req.ControlGenerationMode = self._control_mode
                         req.MaxControlsToCheck = 26
                         req.ExpectedCostSamples = 100
                         req.LeftArmConfiguration = current_real_position
@@ -620,12 +576,10 @@ class JointTrajectoryActionServer(object):
                 rospy.logwarn("No goal tolerance for joint %s, skipping tolerance check" % (name,))
         if goal_met:
             rospy.loginfo("%s: Goal execution complete" % (self._action_name,))
-            self._command_stop(goal.trajectory.joint_names)
             self._result.error_code = self._result.SUCCESSFUL
             self._server.set_succeeded(self._result)
             current_xtf.tags.append("successful")
         elif continue_execution:
-            self._command_stop(goal.trajectory.joint_names)
             rospy.logerr("%s: Aborting due to goal tolerance violation" % (self._action_name,))
             self._result.error_code = self._result.GOAL_TOLERANCE_VIOLATED
             self._server.set_aborted(self._result)
@@ -633,5 +587,5 @@ class JointTrajectoryActionServer(object):
         else:
             rospy.logerr("%s: Already aborted" % (self._action_name,))
         # Write the XTF trajectory to disk
-        self._parser.ExportTraj(current_xtf, current_xtf.uid)
+        self._parser.ExportTraj(current_xtf, self._log_location + current_xtf.uid)
         rospy.loginfo("%s: FollowJointTrajectory action call complete, trajectory execution logged to file %s" % (self._action_name, current_xtf.uid,))
